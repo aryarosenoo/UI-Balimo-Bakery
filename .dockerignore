@@ -1,0 +1,19 @@
+.git
+.venv
+venv
+node_modules
+frontend/node_modules
+dist
+__pycache__
+*.pyc
+*.log
+*.err
+backend.log
+backend.err
+frontend.log
+frontend.err
+Data TA
+Forecasted
+umkm_dashboard
+frontend
+Microsoft

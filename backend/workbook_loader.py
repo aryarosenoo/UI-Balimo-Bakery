@@ -113,15 +113,25 @@ def split_work_center_label(label: Any) -> tuple[str, str]:
     return text, text
 
 
-def get_visible_sheet(workbook, name: str):
-    if name not in workbook.sheetnames:
-        raise KeyError(f'Sheet "{name}" tidak ditemukan di workbook.')
+def get_visible_sheet(workbook, name: str | tuple[str, ...] | list[str]):
+    candidate_names = [name] if isinstance(name, str) else list(name)
+    selected_name = next((candidate for candidate in candidate_names if candidate in workbook.sheetnames), None)
+    if selected_name is None:
+        names_label = " / ".join(candidate_names)
+        raise KeyError(f'Sheet "{names_label}" tidak ditemukan di workbook.')
 
-    sheet = workbook[name]
+    sheet = workbook[selected_name]
     if getattr(sheet, "sheet_state", "visible") != "visible":
-        raise ValueError(f'Sheet "{name}" sedang hidden dan tidak boleh dipakai sebagai sumber data.')
+        raise ValueError(f'Sheet "{selected_name}" sedang hidden dan tidak boleh dipakai sebagai sumber data.')
 
     return sheet
+
+
+def get_optional_visible_sheet(workbook, name: str | tuple[str, ...] | list[str]):
+    try:
+        return get_visible_sheet(workbook, name)
+    except KeyError:
+        return None
 
 
 def list_available_workbooks() -> list[dict[str, Any]]:
@@ -214,6 +224,98 @@ def parse_products(sheet, product_families: dict[str, dict[str, str]]) -> tuple[
         )
 
     return week_numbers, products
+
+
+def build_unique_product_families(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    families: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for product in products:
+        family_id = product.get("family_id") or ""
+        if not family_id or family_id in seen:
+            continue
+        seen.add(family_id)
+        families.append(
+            {
+                "id": family_id,
+                "name": product.get("family_name") or family_id,
+                "color": product.get("color") or PRODUCT_COLORS[len(families) % len(PRODUCT_COLORS)],
+            }
+        )
+
+    return families
+
+
+def parse_aggregate_demand(sheet, products: list[dict[str, Any]], periods_count: int) -> dict[str, Any]:
+    rows = list(sheet.iter_rows(values_only=True))
+    header_index = -1
+    product_columns: list[tuple[int, str]] = []
+
+    for index, row in enumerate(rows):
+        if normalize_key(row[1] if len(row) > 1 else None) != "periode":
+            continue
+        for column_index in range(2, len(row)):
+            label = normalize_text(row[column_index])
+            if label:
+                product_columns.append((column_index, label))
+        if product_columns:
+            header_index = index
+            break
+
+    if header_index == -1 or not product_columns:
+        return {"rows": [], "periods": [], "source_sheet": sheet.title}
+
+    families = build_unique_product_families(products)
+    forecast_rows: list[dict[str, Any]] = []
+
+    for offset, (column_index, label) in enumerate(product_columns):
+        family = families[offset] if offset < len(families) else {}
+        product_id = family.get("id") or f"PRD-{offset + 1:02d}"
+        values: list[float] = []
+
+        for row in rows[header_index + 1 :]:
+            period_no = to_int(row[1] if len(row) > 1 else None)
+            if period_no <= 0:
+                continue
+            values.append(to_number(row[column_index] if len(row) > column_index else None))
+            if len(values) >= periods_count:
+                break
+
+        if len(values) < periods_count:
+            values.extend([0.0] * (periods_count - len(values)))
+
+        forecast_rows.append(
+            {
+                "id": product_id,
+                "name": family.get("name") or label,
+                "label": label,
+                "color": family.get("color") or PRODUCT_COLORS[offset % len(PRODUCT_COLORS)],
+                "values": values[:periods_count],
+                "total": round(sum(values[:periods_count]), 2),
+            }
+        )
+
+    periods = []
+    for index in range(periods_count):
+        period_row = {
+            "week": index + 1,
+            "week_number": index + 1,
+            "period": f"W{index + 1}",
+            "total": 0.0,
+        }
+        for row in forecast_rows:
+            value = row["values"][index] if index < len(row["values"]) else 0.0
+            period_row[row["id"]] = value
+            period_row["total"] += value
+        period_row["total"] = round(period_row["total"], 2)
+        periods.append(period_row)
+
+    return {
+        "rows": forecast_rows,
+        "periods": periods,
+        "source_sheet": sheet.title,
+        "total": round(sum(row["total"] for row in forecast_rows), 2),
+    }
 
 
 def parse_ingredient_master(sheet) -> dict[str, dict[str, Any]]:
@@ -365,10 +467,10 @@ def parse_work_centers(sheet) -> list[dict[str, Any]]:
 
     for row in sheet.iter_rows(values_only=True):
         label = normalize_text(row[0] if len(row) > 0 else None)
-        if not label.startswith("WC-"):
+        work_center_id, name = split_work_center_label(label)
+        if not work_center_id.startswith("WC-"):
             continue
 
-        work_center_id, name = split_work_center_label(label)
         capacity_hours = to_number(row[5] if len(row) > 5 else None)
         work_centers.append(
             {
@@ -469,24 +571,26 @@ def parse_mrp_sheet(
 
 def parse_crp_detail_rows(rows: list[tuple[Any, ...]], start_index: int, end_index: int, periods_count: int, row_type: str) -> list[dict[str, Any]]:
     detail_rows: list[dict[str, Any]] = []
-    current_work_center_label = ""
+    current_work_center_id = ""
+    current_work_center_name = ""
 
     for row in rows[start_index:end_index]:
         work_center_label = normalize_text(row[1] if len(row) > 1 else None)
         item_label = normalize_text(row[2] if len(row) > 2 else None)
-        if work_center_label.startswith("WC-"):
-            current_work_center_label = work_center_label
-        if not current_work_center_label or not item_label:
+        parsed_work_center_id, parsed_work_center_name = split_work_center_label(work_center_label)
+        if parsed_work_center_id.startswith("WC-"):
+            current_work_center_id = parsed_work_center_id
+            current_work_center_name = parsed_work_center_name
+        if not current_work_center_id or not item_label:
             continue
 
-        work_center_id, work_center_name = split_work_center_label(current_work_center_label)
         item_code, item_name = split_item_label(item_label)
         values = extract_series(row, 3, periods_count)
         detail_rows.append(
             {
                 "type": row_type,
-                "work_center_id": work_center_id,
-                "work_center_name": work_center_name,
+                "work_center_id": current_work_center_id,
+                "work_center_name": current_work_center_name,
                 "item_code": item_code,
                 "item_name": item_name,
                 "item_label": item_label,
@@ -505,6 +609,8 @@ def parse_crp_sheet(sheet, periods_count: int) -> dict[str, Any]:
     setup_marker_index = -1
     total_marker_index = -1
     total_header_index = -1
+    capacity_marker_index = -1
+    capacity_header_index = -1
 
     for index, row in enumerate(rows):
         second = normalize_text(row[1] if len(row) > 1 else None)
@@ -517,15 +623,33 @@ def parse_crp_sheet(sheet, periods_count: int) -> dict[str, Any]:
             total_marker_index = index
         elif total_marker_index != -1 and total_header_index == -1 and second == "WC" and third == "Keterangan":
             total_header_index = index
-            break
+        elif second == "Capacity Requirement Planning (CRP)":
+            capacity_marker_index = index
+        elif capacity_marker_index != -1 and capacity_header_index == -1 and second == "WC" and third == "Periode":
+            capacity_header_index = index
 
     if run_header_index == -1 or setup_marker_index == -1 or total_header_index == -1:
         raise ValueError("Sheet CRP tidak memiliki struktur visible yang valid.")
 
     run_rows = parse_crp_detail_rows(rows, run_header_index + 1, setup_marker_index, periods_count, "run")
     setup_rows = parse_crp_detail_rows(rows, setup_marker_index + 1, total_marker_index, periods_count, "setup")
+    work_center_id_by_name = {
+        normalize_key(row["work_center_name"]): row["work_center_id"]
+        for row in [*run_rows, *setup_rows]
+        if row.get("work_center_name") and row.get("work_center_id")
+    }
 
     totals_by_wc: dict[str, dict[str, Any]] = {}
+    available_time_by_wc: dict[str, list[float]] = {}
+    total_header = rows[total_header_index]
+    available_time_index = next(
+        (
+            column_index
+            for column_index, value in enumerate(total_header)
+            if normalize_key(value) == "availabletimeweek"
+        ),
+        -1,
+    )
     for row in rows[total_header_index + 1 :]:
         work_center_label = normalize_text(row[1] if len(row) > 1 else None)
         description = normalize_text(row[2] if len(row) > 2 else None)
@@ -535,6 +659,7 @@ def parse_crp_sheet(sheet, periods_count: int) -> dict[str, Any]:
             continue
 
         work_center_id, work_center_name = split_work_center_label(work_center_label)
+        work_center_id = work_center_id_by_name.get(normalize_key(work_center_name), work_center_id)
         values = extract_series(row, 3, periods_count)
         totals_by_wc[work_center_id] = {
             "id": work_center_id,
@@ -543,11 +668,38 @@ def parse_crp_sheet(sheet, periods_count: int) -> dict[str, Any]:
             "values": values,
             "total_minutes": round(sum(values), 2),
         }
+        weekly_capacity = to_number(row[available_time_index] if available_time_index != -1 and len(row) > available_time_index else None)
+        if weekly_capacity:
+            available_time_by_wc[work_center_id] = [weekly_capacity] * periods_count
+
+    if capacity_header_index != -1:
+        capacity_header = rows[capacity_header_index]
+        capacity_week_index = next(
+            (
+                column_index
+                for column_index, value in enumerate(capacity_header)
+                if normalize_key(value) == "capacityweek"
+            ),
+            -1,
+        )
+        for row in rows[capacity_header_index + 2 :]:
+            work_center_id = canonicalize_work_center_id(row[1] if len(row) > 1 else None)
+            if not work_center_id.startswith("WC-"):
+                if available_time_by_wc:
+                    break
+                continue
+            values = extract_series(row, 2, periods_count)
+            weekly_capacity = to_number(row[capacity_week_index] if capacity_week_index != -1 and len(row) > capacity_week_index else None)
+            if any(values):
+                available_time_by_wc[work_center_id] = values
+            elif weekly_capacity:
+                available_time_by_wc[work_center_id] = [weekly_capacity] * periods_count
 
     return {
         "run_rows": run_rows,
         "setup_rows": setup_rows,
         "totals_by_wc": totals_by_wc,
+        "available_time_by_wc": available_time_by_wc,
     }
 
 
@@ -556,9 +708,12 @@ def parse_bol_rccp_sheet(sheet, periods_count: int) -> dict[str, Any]:
     bill_of_labour_by_wc: dict[str, dict[str, Any]] = {}
     loads_by_wc: dict[str, list[float]] = {}
     available_time_by_wc: dict[str, list[float]] = {}
+    lot_size_by_item: dict[str, float] = {}
+    lot_size_by_name: dict[str, float] = {}
     rccp_week_numbers: list[int] = []
     work_center_order: list[str] = []
 
+    bol_detail_header_index = -1
     bill_header_index = -1
     rccp_marker_index = -1
     rccp_header_index = -1
@@ -566,6 +721,10 @@ def parse_bol_rccp_sheet(sheet, periods_count: int) -> dict[str, Any]:
     for index, row in enumerate(rows):
         second = normalize_text(row[1] if len(row) > 1 else None)
         third = normalize_text(row[2] if len(row) > 2 else None)
+        fourth = normalize_text(row[3] if len(row) > 3 else None)
+        ninth = normalize_text(row[8] if len(row) > 8 else None)
+        if bol_detail_header_index == -1 and second == "Item" and third == "Level" and fourth == "Work Center" and ninth == "Lot Size":
+            bol_detail_header_index = index
         if bill_header_index == -1 and second == "Work Center" and third == "Processing Time":
             bill_header_index = index
         if second == "RCCP":
@@ -576,6 +735,19 @@ def parse_bol_rccp_sheet(sheet, periods_count: int) -> dict[str, Any]:
 
     if bill_header_index == -1 or rccp_header_index == -1:
         raise ValueError('Sheet "BOL + RCCP" tidak memiliki struktur RCCP yang valid.')
+
+    if bol_detail_header_index != -1:
+        for row in rows[bol_detail_header_index + 1 : bill_header_index]:
+            item_label = normalize_text(row[1] if len(row) > 1 else None)
+            lot_size = to_number(row[8] if len(row) > 8 else None)
+            if not item_label or lot_size <= 0:
+                continue
+            item_code, item_name = split_item_label(item_label)
+            if item_code:
+                lot_size_by_item[item_code] = lot_size
+            if item_name:
+                lot_size_by_name[normalize_key(item_name)] = lot_size
+            lot_size_by_name[normalize_key(item_label)] = lot_size
 
     for row in rows[bill_header_index + 1 :]:
         work_center_id = canonicalize_work_center_id(row[1] if len(row) > 1 else None)
@@ -629,7 +801,23 @@ def parse_bol_rccp_sheet(sheet, periods_count: int) -> dict[str, Any]:
         "bill_of_labour_by_wc": bill_of_labour_by_wc,
         "loads_by_wc": loads_by_wc,
         "available_time_by_wc": available_time_by_wc,
+        "lot_size_by_item": lot_size_by_item,
+        "lot_size_by_name": lot_size_by_name,
     }
+
+
+def apply_bol_lot_sizes_to_mrp(mrp: dict[str, Any], bol_rccp: dict[str, Any]) -> None:
+    lot_size_by_item = bol_rccp.get("lot_size_by_item", {})
+    lot_size_by_name = bol_rccp.get("lot_size_by_name", {})
+
+    for item in mrp.get("items", []):
+        lot_size = lot_size_by_item.get(item.get("code") or "")
+        if lot_size is None:
+            lot_size = lot_size_by_name.get(normalize_key(item.get("name")))
+        if lot_size is None:
+            lot_size = lot_size_by_name.get(normalize_key(item.get("label")))
+        if lot_size is not None:
+            item["lot_size"] = lot_size
 
 
 def parse_routes(route_sheet, route_store_sheet) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -692,6 +880,73 @@ def parse_routes(route_sheet, route_store_sheet) -> tuple[list[dict[str, Any]], 
     return routes, stores
 
 
+def parse_forward_schedule_sheet(sheet, periods_count: int) -> dict[str, Any]:
+    rows = list(sheet.iter_rows(values_only=True))
+    header_index = -1
+
+    for index, row in enumerate(rows):
+        first = normalize_key(row[0] if len(row) > 0 else None)
+        third = normalize_key(row[2] if len(row) > 2 else None)
+        if first.startswith("produk") and third.startswith("periode"):
+            header_index = index
+            break
+
+    if header_index == -1:
+        return {"rows": [], "source_sheet": sheet.title}
+
+    schedule_rows: list[dict[str, Any]] = []
+    operation_index_by_product_period: dict[tuple[str, int], int] = {}
+
+    for row in rows[header_index + 1 :]:
+        product_label = normalize_text(row[0] if len(row) > 0 else None)
+        match = re.match(r"^(P-\d{2})\s*(.*)$", product_label)
+        if not match:
+            continue
+
+        period_no = to_int(row[2] if len(row) > 2 else None)
+        if period_no <= 0 or period_no > periods_count:
+            continue
+
+        quantity = to_number(row[3] if len(row) > 3 else None)
+        if quantity <= 0:
+            continue
+
+        product_id = match.group(1)
+        product_name = normalize_text(match.group(2)) or product_id
+        group_key = (product_id, period_no)
+        operation_no = operation_index_by_product_period.get(group_key, 0) + 1
+        operation_index_by_product_period[group_key] = operation_no
+
+        schedule_rows.append(
+            {
+                "product_id": product_id,
+                "product_name": product_name,
+                "period": period_no,
+                "quantity": quantity,
+                "lot_size": to_number(row[1] if len(row) > 1 else None),
+                "lot_count": to_number(row[4] if len(row) > 4 else None),
+                "level": normalize_text(row[5] if len(row) > 5 else None),
+                "work_center_id": canonicalize_work_center_id(row[6] if len(row) > 6 else None),
+                "work_center_name": normalize_text(row[7] if len(row) > 7 else None),
+                "operation_no": operation_no,
+                "operation_name": normalize_text(row[8] if len(row) > 8 else None),
+                "setup_minutes": to_number(row[9] if len(row) > 9 else None),
+                "run_minutes": to_number(row[10] if len(row) > 10 else None),
+                "duration_minutes": to_number(row[11] if len(row) > 11 else None),
+                "duration_hours": to_number(row[12] if len(row) > 12 else None),
+                "start_hour": to_number(row[13] if len(row) > 13 else None),
+                "finish_hour": to_number(row[14] if len(row) > 14 else None),
+                "status_label": normalize_text(row[15] if len(row) > 15 else None),
+            }
+        )
+
+    return {
+        "rows": schedule_rows,
+        "source_sheet": sheet.title,
+        "available_periods": len({row["period"] for row in schedule_rows}),
+    }
+
+
 @lru_cache(maxsize=4)
 def _load_dataset(path_str: str, mtime_ns: int, size_bytes: int) -> dict[str, Any]:
     workbook_path = Path(path_str)
@@ -708,10 +963,17 @@ def _load_dataset(path_str: str, mtime_ns: int, size_bytes: int) -> dict[str, An
     route_store_sheet = get_visible_sheet(workbook, "Rute-Toko")
     mrp_sheet = get_visible_sheet(workbook, "MRP")
     crp_sheet = get_visible_sheet(workbook, "CRP")
-    bol_rccp_sheet = get_visible_sheet(workbook, "BOL + RCCP")
+    bol_rccp_sheet = get_visible_sheet(workbook, ("BOL + RCCP", "RCCP + BOL"))
+    aggregate_demand_sheet = get_optional_visible_sheet(workbook, ("Agregate Demand", "Aggregate Demand"))
+    forward_schedule_sheet = get_optional_visible_sheet(workbook, ("Forward Scheduling (2)", "Forward Scheduling"))
 
     product_families = parse_product_families(data_produk_sheet)
     week_numbers, products = parse_products(mps_sheet, product_families)
+    forecast = (
+        parse_aggregate_demand(aggregate_demand_sheet, products, len(week_numbers))
+        if aggregate_demand_sheet is not None
+        else {"rows": [], "periods": [], "source_sheet": ""}
+    )
     ingredient_map = parse_ingredient_master(ingredient_sheet)
     components, bom_entries, bom_by_product = parse_bom(bom_sheet, ingredient_map)
     routing_entries, routing_by_product, routing_by_item = parse_routing(routing_sheet)
@@ -725,6 +987,12 @@ def _load_dataset(path_str: str, mtime_ns: int, size_bytes: int) -> dict[str, An
     mrp = parse_mrp_sheet(mrp_sheet, len(week_numbers), product_lookup_by_name, ingredient_map)
     crp = parse_crp_sheet(crp_sheet, len(week_numbers))
     bol_rccp = parse_bol_rccp_sheet(bol_rccp_sheet, len(week_numbers))
+    production_schedule = (
+        parse_forward_schedule_sheet(forward_schedule_sheet, len(week_numbers))
+        if forward_schedule_sheet is not None
+        else {"rows": [], "source_sheet": ""}
+    )
+    apply_bol_lot_sizes_to_mrp(mrp, bol_rccp)
 
     return {
         "source_name": workbook_path.name,
@@ -733,6 +1001,7 @@ def _load_dataset(path_str: str, mtime_ns: int, size_bytes: int) -> dict[str, An
         "available_periods": len(week_numbers),
         "week_numbers": week_numbers,
         "products": products,
+        "forecast": forecast,
         "product_lookup": product_lookup,
         "components": components,
         "bom_entries": bom_entries,
@@ -745,6 +1014,7 @@ def _load_dataset(path_str: str, mtime_ns: int, size_bytes: int) -> dict[str, An
         "mrp": mrp,
         "bol_rccp": bol_rccp,
         "crp": crp,
+        "production_schedule": production_schedule,
         "routes": routes,
         "stores": stores,
     }

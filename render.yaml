@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: balimo-bakery-dss
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /api/health
+    envVars:
+      - key: DSS_DB_HOST
+        fromDatabase:
+          name: balimo-bakery-db
+          property: host
+      - key: DSS_DB_PORT
+        fromDatabase:
+          name: balimo-bakery-db
+          property: port
+      - key: DSS_DB_NAME
+        fromDatabase:
+          name: balimo-bakery-db
+          property: database
+      - key: DSS_DB_USER
+        fromDatabase:
+          name: balimo-bakery-db
+          property: user
+      - key: DSS_DB_PASSWORD
+        fromDatabase:
+          name: balimo-bakery-db
+          property: password
+      - key: DSS_DB_SCHEMA
+        value: dss
+      - key: DSS_SCENARIO_CODE
+        value: default
+      - key: DSS_PSQL_PATH
+        value: /usr/bin/psql
+
+databases:
+  - name: balimo-bakery-db
+    databaseName: balimo_bakery_dss
+    user: balimo_bakery_dss
+    plan: starter

@@ -3,7 +3,7 @@ from __future__ import annotations
 from statistics import mean
 from typing import Any, Callable
 
-from .workbook_loader import get_dataset, list_available_workbooks
+from .postgres_dataset_loader import build_dataset_from_database, list_database_sources
 
 
 MRP_CATEGORY_LABELS = {
@@ -58,6 +58,54 @@ def build_mps(dataset: dict[str, Any], periods: int) -> dict[str, Any]:
         "periods": period_rows,
         "rows": product_rows,
         "total_production": sum(row["total"] for row in period_rows),
+    }
+
+
+def build_forecast(dataset: dict[str, Any], periods: int) -> dict[str, Any]:
+    source = dataset.get("forecast", {})
+    source_rows = source.get("rows") or []
+    source_periods = source.get("periods") or []
+    forecast_rows: list[dict[str, Any]] = []
+
+    for row in source_rows:
+        values = list(row.get("values", []))[:periods]
+        if len(values) < periods:
+            values.extend([0.0] * (periods - len(values)))
+        forecast_rows.append(
+            {
+                "id": row.get("id") or "",
+                "name": row.get("name") or row.get("id") or "",
+                "color": row.get("color") or "#38bdf8",
+                "values": values,
+                "total": round(sum(values), 2),
+                "customer_order_values": list(row.get("customer_order_values", []))[:periods],
+                "total_customer_order": row.get("total_customer_order", round(sum(values), 2)),
+            }
+        )
+
+    period_rows: list[dict[str, Any]] = []
+    for week_index in range(periods):
+        source_period = source_periods[week_index] if week_index < len(source_periods) else {}
+        period_row = {
+            "week": week_index + 1,
+            "week_number": dataset["week_numbers"][week_index],
+            "period": f"W{week_index + 1}",
+            "total": 0.0,
+            "total_customer_order": source_period.get("total_customer_order", 0.0),
+        }
+        for row in forecast_rows:
+            value = row["values"][week_index] if week_index < len(row["values"]) else 0.0
+            period_row[row["id"]] = value
+            period_row["total"] += value
+        period_row["total"] = round(period_row["total"], 2)
+        period_rows.append(period_row)
+
+    return {
+        "periods": period_rows,
+        "rows": forecast_rows,
+        "total_forecast": round(sum(row["total"] for row in forecast_rows), 2),
+        "source": source.get("source") or "dss.demand_plans",
+        "policy": "Forecast dibaca dari tabel PostgreSQL dss.demand_plans hasil import Agregate Demand.",
     }
 
 
@@ -215,7 +263,7 @@ def build_rccp(dataset: dict[str, Any], periods: int) -> dict[str, Any]:
         **summary,
         "active_work_center_ids": active_work_center_ids,
         "product_rows": [],
-        "policy": 'RCCP mengikuti load mingguan pada sheet visible "BOL + RCCP". Available time juga memakai blok RCCP pada sheet yang sama.',
+        "policy": "RCCP memakai load dan available time dari sheet BOL + RCCP pada data perencanaan aktif.",
     }
 
 
@@ -225,6 +273,10 @@ def build_crp(dataset: dict[str, Any], periods: int) -> dict[str, Any]:
     wc_loads = {
         work_center["id"]: crp["totals_by_wc"].get(work_center["id"], {}).get("values", [0.0] * periods)[:periods]
         for work_center in work_centers
+    }
+    available_time_lookup = {
+        work_center_id: values[:periods]
+        for work_center_id, values in crp.get("available_time_by_wc", {}).items()
     }
     detail_rows = [
         {
@@ -239,15 +291,42 @@ def build_crp(dataset: dict[str, Any], periods: int) -> dict[str, Any]:
         wc_loads=wc_loads,
         periods=periods,
         week_numbers=dataset["week_numbers"],
-        available_time_values_resolver=lambda work_center: [work_center["capacity_minutes"]] * periods,
-        planning_factor_resolver=lambda work_center: 100.0,
+        available_time_values_resolver=lambda work_center: (
+            available_time_lookup.get(work_center["id"])
+            or [work_center["capacity_minutes"]] * periods
+        ),
+        planning_factor_resolver=lambda work_center: (
+            (
+                (mean(available_time_lookup[work_center["id"]]) / work_center["capacity_minutes"]) * 100
+            )
+            if work_center["id"] in available_time_lookup and work_center["capacity_minutes"]
+            else 100.0
+        ),
     )
 
     return {
         **summary,
         "detail_rows": detail_rows,
-        "policy": 'CRP memakai total kebutuhan kapasitas dari sheet visible "CRP". Available time = capacity master WC.',
+        "policy": "CRP memakai run time, setup time, total kebutuhan, dan available time dari data CRP aktif.",
     }
+
+
+def has_mrp_material_activity(item: dict[str, Any]) -> bool:
+    if item.get("category") != "raw_material":
+        return True
+
+    for key in [
+        "total_gross_requirement",
+        "total_net_requirement",
+        "total_planned_order_receipt",
+        "total_planned_order_release",
+    ]:
+        try:
+            if abs(float(item.get(key) or 0)) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 def summarize_mrp_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -274,9 +353,14 @@ def summarize_mrp_item(item: dict[str, Any]) -> dict[str, Any]:
 
 def build_mrp(dataset: dict[str, Any], selected_item_id: str | None, periods: int) -> dict[str, Any]:
     mrp_data = dataset["mrp"]
-    all_items = [summarize_mrp_item(item) for item in mrp_data["items"]]
+    source_items = [item for item in mrp_data["items"] if has_mrp_material_activity(item)]
+    all_items = [summarize_mrp_item(item) for item in source_items]
     items_by_category = {
-        key: [summarize_mrp_item(item) for item in mrp_data["by_category"].get(key, [])]
+        key: [
+            summarize_mrp_item(item)
+            for item in mrp_data["by_category"].get(key, [])
+            if has_mrp_material_activity(item)
+        ]
         for key in MRP_CATEGORY_ORDER
     }
     categories = [
@@ -293,7 +377,11 @@ def build_mrp(dataset: dict[str, Any], selected_item_id: str | None, periods: in
     if selectable_items and selected_item_id not in selectable_lookup:
         selected_item_id = selectable_items[0]["id"]
     selected_item = selectable_lookup.get(selected_item_id) if selected_item_id else None
-    selected_item_source = mrp_data["item_lookup"].get(selected_item_id) if selected_item_id else None
+    selected_item_source = (
+        mrp_data["item_lookup"].get(selected_item_id)
+        if selected_item_id and selected_item_id in selectable_lookup
+        else None
+    )
 
     detail_rows: list[dict[str, Any]] = []
     if selected_item_source is not None:
@@ -319,7 +407,7 @@ def build_mrp(dataset: dict[str, Any], selected_item_id: str | None, periods: in
         "selected_category": selected_item["category"] if selected_item else "raw_material",
         "selected_item": selected_item,
         "periods": detail_rows,
-        "policy": 'Nilai MRP mengikuti sheet visible "MRP"; backend tidak membaca sheet hidden secara langsung.',
+        "policy": "MRP menampilkan bahan baku yang memiliki kebutuhan dari BOM/MRP; item bahan baku bernilai 0 disembunyikan.",
     }
 
 
@@ -328,6 +416,253 @@ def build_routes(dataset: dict[str, Any]) -> dict[str, Any]:
         "routes": dataset["routes"],
         "stores": dataset["stores"],
         "total_stores": len(dataset["stores"]),
+    }
+
+
+def build_crp_detail_lookup(crp: dict[str, Any]) -> dict[tuple[int, str, str], dict[str, float]]:
+    detail_lookup: dict[tuple[int, str, str], dict[str, float]] = {}
+
+    for row in crp.get("detail_rows", []):
+        product_id = row.get("item_code", "")
+        work_center_id = row.get("work_center_id", "")
+        if not product_id.startswith("P-") or not work_center_id:
+            continue
+
+        value_key = "setup_minutes" if row.get("type") == "setup" else "run_minutes"
+        for period_index, value in enumerate(row.get("values", [])):
+            lookup_key = (period_index, product_id, work_center_id)
+            detail_lookup.setdefault(lookup_key, {"run_minutes": 0.0, "setup_minutes": 0.0})
+            detail_lookup[lookup_key][value_key] += float(value or 0)
+
+    return detail_lookup
+
+
+def build_product_processing_times(
+    *,
+    product: dict[str, Any],
+    quantity: float,
+    period_index: int,
+    work_centers: list[dict[str, Any]],
+    crp_detail_lookup: dict[tuple[int, str, str], dict[str, float]],
+    routing_by_product: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    processing_times: list[dict[str, Any]] = []
+
+    for work_center in work_centers:
+        detail = crp_detail_lookup.get(
+            (period_index, product["id"], work_center["id"]),
+            {"run_minutes": 0.0, "setup_minutes": 0.0},
+        )
+        run_minutes = float(detail.get("run_minutes", 0.0))
+        setup_minutes = float(detail.get("setup_minutes", 0.0))
+        processing_times.append(
+            {
+                "work_center_id": work_center["id"],
+                "work_center_name": work_center["name"],
+                "run_minutes": round(run_minutes, 2),
+                "setup_minutes": round(setup_minutes, 2),
+                "duration_minutes": round(run_minutes + setup_minutes, 2),
+            }
+        )
+
+    if sum(row["duration_minutes"] for row in processing_times) > 0 or quantity <= 0:
+        return processing_times
+
+    fallback_by_work_center: dict[str, dict[str, float]] = {}
+    for routing in routing_by_product.get(product["id"], []):
+        work_center_id = routing.get("work_center_id", "")
+        if not work_center_id:
+            continue
+        fallback_by_work_center.setdefault(work_center_id, {"run_minutes": 0.0, "setup_minutes": 0.0})
+        fallback_by_work_center[work_center_id]["run_minutes"] += float(routing.get("run_minutes", 0.0)) * quantity
+        fallback_by_work_center[work_center_id]["setup_minutes"] += float(routing.get("setup_minutes", 0.0))
+
+    for row in processing_times:
+        fallback = fallback_by_work_center.get(row["work_center_id"], {})
+        row["run_minutes"] = round(fallback.get("run_minutes", 0.0), 2)
+        row["setup_minutes"] = round(fallback.get("setup_minutes", 0.0), 2)
+        row["duration_minutes"] = round(row["run_minutes"] + row["setup_minutes"], 2)
+
+    return processing_times
+
+
+def johnson_sequence(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    front = sorted(
+        (job for job in jobs if job["machine_a_minutes"] <= job["machine_b_minutes"]),
+        key=lambda job: (job["machine_a_minutes"], job["machine_b_minutes"], job["position"]),
+    )
+    back = sorted(
+        (job for job in jobs if job["machine_a_minutes"] > job["machine_b_minutes"]),
+        key=lambda job: (-job["machine_b_minutes"], -job["machine_a_minutes"], job["position"]),
+    )
+    return [*front, *back]
+
+
+def evaluate_flow_shop(sequence: list[dict[str, Any]], work_centers: list[dict[str, Any]]) -> dict[str, Any]:
+    machine_ready = [0.0 for _ in work_centers]
+    operations: list[dict[str, Any]] = []
+    sequence_rows: list[dict[str, Any]] = []
+
+    for step, job in enumerate(sequence, start=1):
+        previous_machine_finish = 0.0
+
+        for machine_index, work_center in enumerate(work_centers):
+            duration = job["durations"][machine_index] if machine_index < len(job["durations"]) else 0.0
+            start_minute = max(machine_ready[machine_index], previous_machine_finish)
+            finish_minute = start_minute + duration
+
+            if duration > 0:
+                operations.append(
+                    {
+                        "step": step,
+                        "product_id": job["id"],
+                        "product_name": job["name"],
+                        "work_center_id": work_center["id"],
+                        "work_center_name": work_center["name"],
+                        "start_minute": round(start_minute, 2),
+                        "finish_minute": round(finish_minute, 2),
+                        "duration_minutes": round(duration, 2),
+                    }
+                )
+
+            machine_ready[machine_index] = finish_minute
+            previous_machine_finish = finish_minute
+
+        sequence_rows.append(
+            {
+                "step": step,
+                "id": job["id"],
+                "name": job["name"],
+                "color": job["color"],
+                "quantity": job["quantity"],
+                "processing_times": job["processing_times"],
+                "total_processing_minutes": round(sum(job["durations"]), 2),
+                "completion_time_minutes": round(previous_machine_finish, 2),
+            }
+        )
+
+    makespan = max(machine_ready, default=0.0)
+    return {
+        "makespan_minutes": round(makespan, 2),
+        "operations": operations,
+        "sequence": sequence_rows,
+    }
+
+
+def build_cds_schedule(jobs: list[dict[str, Any]], work_centers: list[dict[str, Any]]) -> dict[str, Any]:
+    active_indexes = [
+        index
+        for index, _ in enumerate(work_centers)
+        if any(job["processing_times"][index]["duration_minutes"] > 0 for job in jobs)
+    ]
+    active_work_centers = [
+        {
+            "id": work_centers[index]["id"],
+            "name": work_centers[index]["name"],
+            "available_time_minutes": work_centers[index].get(
+                "available_time_minutes",
+                work_centers[index].get("capacity_minutes", 0.0),
+            ),
+        }
+        for index in active_indexes
+    ]
+    scheduled_jobs = []
+
+    for position, job in enumerate(jobs):
+        filtered_processing_times = [job["processing_times"][index] for index in active_indexes]
+        durations = [row["duration_minutes"] for row in filtered_processing_times]
+        scheduled_jobs.append(
+            {
+                **job,
+                "position": position,
+                "processing_times": filtered_processing_times,
+                "durations": durations,
+                "total_processing_minutes": round(sum(durations), 2),
+            }
+        )
+
+    if not scheduled_jobs:
+        return {
+            "products": [],
+            "sequence": [],
+            "operations": [],
+            "work_centers": active_work_centers,
+            "cds": {
+                "selected_iteration": None,
+                "candidate_count": 0,
+                "makespan_minutes": 0.0,
+                "sequence": [],
+                "sequence_label": "-",
+            },
+            "cds_candidates": [],
+        }
+
+    if len(active_work_centers) < 2 or len(scheduled_jobs) < 2:
+        evaluation = evaluate_flow_shop(scheduled_jobs, active_work_centers)
+        return {
+            "products": scheduled_jobs,
+            "sequence": evaluation["sequence"],
+            "operations": evaluation["operations"],
+            "work_centers": active_work_centers,
+            "cds": {
+                "selected_iteration": 0,
+                "candidate_count": 0,
+                "makespan_minutes": evaluation["makespan_minutes"],
+                "sequence": [job["id"] for job in scheduled_jobs],
+                "sequence_label": " -> ".join(job["id"] for job in scheduled_jobs),
+            },
+            "cds_candidates": [],
+        }
+
+    machine_count = len(active_work_centers)
+    best_evaluation: dict[str, Any] | None = None
+    best_sequence: list[dict[str, Any]] = []
+    best_iteration = 0
+    candidate_rows: list[dict[str, Any]] = []
+
+    for split_index in range(1, machine_count):
+        decorated_jobs = []
+        for job in scheduled_jobs:
+            decorated_jobs.append(
+                {
+                    **job,
+                    "machine_a_minutes": round(sum(job["durations"][:split_index]), 2),
+                    "machine_b_minutes": round(sum(job["durations"][machine_count - split_index :]), 2),
+                }
+            )
+
+        sequence = johnson_sequence(decorated_jobs)
+        evaluation = evaluate_flow_shop(sequence, active_work_centers)
+        candidate_rows.append(
+            {
+                "iteration": split_index,
+                "machine_a": [work_center["id"] for work_center in active_work_centers[:split_index]],
+                "machine_b": [work_center["id"] for work_center in active_work_centers[machine_count - split_index :]],
+                "sequence": [job["id"] for job in sequence],
+                "sequence_label": " -> ".join(job["id"] for job in sequence),
+                "makespan_minutes": evaluation["makespan_minutes"],
+            }
+        )
+
+        if best_evaluation is None or evaluation["makespan_minutes"] < best_evaluation["makespan_minutes"]:
+            best_evaluation = evaluation
+            best_sequence = sequence
+            best_iteration = split_index
+
+    selected_evaluation = best_evaluation or evaluate_flow_shop(scheduled_jobs, active_work_centers)
+    return {
+        "products": scheduled_jobs,
+        "sequence": selected_evaluation["sequence"],
+        "operations": selected_evaluation["operations"],
+        "work_centers": active_work_centers,
+        "cds": {
+            "selected_iteration": best_iteration,
+            "candidate_count": len(candidate_rows),
+            "makespan_minutes": selected_evaluation["makespan_minutes"],
+            "sequence": [job["id"] for job in best_sequence],
+            "sequence_label": " -> ".join(job["id"] for job in best_sequence),
+        },
+        "cds_candidates": candidate_rows,
     }
 
 
@@ -395,20 +730,57 @@ def build_dashboard(
     }
 
 
-def build_schedule(mps: dict[str, Any], crp: dict[str, Any], routes: dict[str, Any]) -> dict[str, Any]:
+def build_schedule(
+    mps: dict[str, Any],
+    crp: dict[str, Any],
+    routes: dict[str, Any],
+    dataset: dict[str, Any],
+) -> dict[str, Any]:
+    imported_schedule = build_imported_schedule(crp, routes, dataset)
+    if imported_schedule["weeks"]:
+        return imported_schedule
+
     weeks = []
+    work_centers = crp.get("work_centers", dataset.get("work_centers", []))
+    crp_detail_lookup = build_crp_detail_lookup(crp)
 
     for index, period in enumerate(mps["periods"]):
         capacity_row = crp["periods"][index]
+        product_jobs = []
+        for product_row in mps["rows"]:
+            quantity = period[product_row["id"]]
+            if quantity <= 0:
+                continue
+
+            processing_times = build_product_processing_times(
+                product=product_row,
+                quantity=quantity,
+                period_index=index,
+                work_centers=work_centers,
+                crp_detail_lookup=crp_detail_lookup,
+                routing_by_product=dataset.get("routing_by_product", {}),
+            )
+            product_jobs.append(
+                {
+                    "id": product_row["id"],
+                    "name": product_row["name"],
+                    "color": product_row["color"],
+                    "quantity": quantity,
+                    "processing_times": processing_times,
+                }
+            )
+
+        cds_schedule = build_cds_schedule(product_jobs, work_centers)
         products = [
             {
-                "id": product_row["id"],
-                "name": product_row["name"],
-                "color": product_row["color"],
-                "quantity": period[product_row["id"]],
+                "id": product["id"],
+                "name": product["name"],
+                "color": product["color"],
+                "quantity": product["quantity"],
+                "processing_times": product["processing_times"],
+                "total_processing_minutes": product["total_processing_minutes"],
             }
-            for product_row in mps["rows"]
-            if period[product_row["id"]] > 0
+            for product in cds_schedule["products"]
         ]
 
         bottleneck = capacity_row["bottleneck"]
@@ -428,6 +800,11 @@ def build_schedule(mps: dict[str, Any], crp: dict[str, Any], routes: dict[str, A
                 "products": products,
                 "status": status,
                 "bottleneck": bottleneck,
+                "work_centers": cds_schedule["work_centers"],
+                "sequence": cds_schedule["sequence"],
+                "operations": cds_schedule["operations"],
+                "cds": cds_schedule["cds"],
+                "cds_candidates": cds_schedule["cds_candidates"],
                 "routes": [
                     {
                         "id": route["id"],
@@ -440,32 +817,234 @@ def build_schedule(mps: dict[str, Any], crp: dict[str, Any], routes: dict[str, A
             }
         )
 
-    return {"weeks": weeks}
+    return {
+        "algorithm": {
+            "key": "cds",
+            "name": "Campbell-Dudek-Smith (CDS)",
+            "description": "CDS membentuk kandidat Johnson untuk beberapa split work center, lalu memilih urutan dengan makespan terendah.",
+        },
+        "weeks": weeks,
+    }
+
+
+def build_imported_schedule(
+    crp: dict[str, Any],
+    routes: dict[str, Any],
+    dataset: dict[str, Any],
+) -> dict[str, Any]:
+    schedule_rows = dataset.get("production_schedule", {}).get("rows") or []
+    if not schedule_rows:
+        return {
+            "algorithm": {
+                "key": "cds",
+                "name": "Campbell-Dudek-Smith (CDS)",
+                "description": "Fallback perhitungan CDS dipakai karena tabel schedule PostgreSQL belum berisi data.",
+            },
+            "weeks": [],
+        }
+
+    product_lookup = dataset.get("product_lookup", {})
+    work_center_lookup = dataset.get("work_center_lookup", {})
+    rows_by_period: dict[int, list[dict[str, Any]]] = {}
+    for row in schedule_rows:
+        rows_by_period.setdefault(int(row.get("period") or 0), []).append(row)
+
+    weeks = []
+    for period_no in sorted(rows_by_period):
+        if period_no <= 0 or period_no > len(dataset["week_numbers"]):
+            continue
+
+        period_rows = sorted(rows_by_period[period_no], key=lambda row: row.get("product_id") or "")
+        products = []
+        sequence = []
+        operations = []
+        active_work_centers: dict[str, dict[str, Any]] = {}
+        max_completion_minutes = 0.0
+        has_overload = False
+
+        for product_index, row in enumerate(period_rows, start=1):
+            product_id = row.get("product_id") or ""
+            product = product_lookup.get(product_id, {})
+            operation_rows = row.get("operations") or []
+            processing_times = []
+            product_completion_minutes = 0.0
+            shift_start_hour = min(
+                (float(operation.get("start_hour") or 8) for operation in operation_rows),
+                default=8.0,
+            )
+
+            for operation in sorted(operation_rows, key=lambda item: item.get("operation_no") or 0):
+                work_center_id = operation.get("work_center_id") or ""
+                work_center = work_center_lookup.get(work_center_id, {})
+                duration_minutes = round(float(operation.get("duration_minutes") or 0), 2)
+                start_hour = float(operation.get("start_hour") or shift_start_hour)
+                finish_hour = float(operation.get("finish_hour") or start_hour)
+                start_minute = round((start_hour - shift_start_hour) * 60, 2)
+                finish_minute = round((finish_hour - shift_start_hour) * 60, 2)
+                product_completion_minutes = max(product_completion_minutes, finish_minute)
+
+                active_work_centers.setdefault(
+                    work_center_id,
+                    {
+                        "id": work_center_id,
+                        "name": operation.get("work_center_name") or work_center.get("name", work_center_id),
+                        "available_time_minutes": work_center.get("available_time_minutes", work_center.get("capacity_minutes", 0.0)),
+                    },
+                )
+                processing_times.append(
+                    {
+                        "work_center_id": work_center_id,
+                        "work_center_name": operation.get("work_center_name") or work_center.get("name", work_center_id),
+                        "run_minutes": round(float(operation.get("run_minutes") or 0), 2),
+                        "setup_minutes": round(float(operation.get("setup_minutes") or 0), 2),
+                        "duration_minutes": duration_minutes,
+                        "operation_name": operation.get("operation_name") or "",
+                        "start_hour": start_hour,
+                        "finish_hour": finish_hour,
+                        "status_label": operation.get("status_label") or "",
+                    }
+                )
+                operations.append(
+                    {
+                        "step": product_index,
+                        "product_id": product_id,
+                        "product_name": row.get("product_name") or product.get("name", product_id),
+                        "work_center_id": work_center_id,
+                        "work_center_name": operation.get("work_center_name") or work_center.get("name", work_center_id),
+                        "operation_name": operation.get("operation_name") or "",
+                        "start_minute": start_minute,
+                        "finish_minute": finish_minute,
+                        "duration_minutes": duration_minutes,
+                    }
+                )
+
+            total_processing_minutes = round(
+                float(row.get("total_duration_minutes") or 0)
+                or sum(item["duration_minutes"] for item in processing_times),
+                2,
+            )
+            product_payload = {
+                "id": product_id,
+                "name": row.get("product_name") or product.get("name", product_id),
+                "color": product.get("color", "#38bdf8"),
+                "quantity": row.get("quantity") or 0,
+                "processing_times": processing_times,
+                "total_processing_minutes": total_processing_minutes,
+            }
+            products.append(product_payload)
+            sequence.append(
+                {
+                    **product_payload,
+                    "step": product_index,
+                    "completion_time_minutes": round(product_completion_minutes or total_processing_minutes, 2),
+                }
+            )
+            max_completion_minutes = max(max_completion_minutes, product_completion_minutes or total_processing_minutes)
+            has_overload = has_overload or row.get("capacity_status") == "overload"
+
+        total = round(sum(float(row.get("quantity") or 0) for row in period_rows), 2)
+        bottleneck = crp["periods"][period_no - 1]["bottleneck"] if period_no - 1 < len(crp.get("periods", [])) else {}
+        status = (
+            {"key": "overload", "label": "Overload", "color": "#ef4444"}
+            if has_overload
+            else {"key": "normal", "label": "Normal", "color": "#22c55e"}
+        )
+        weeks.append(
+            {
+                "week": period_no,
+                "week_number": dataset["week_numbers"][period_no - 1],
+                "period": f"W{period_no}",
+                "total": total,
+                "products": products,
+                "status": status,
+                "bottleneck": bottleneck,
+                "work_centers": list(active_work_centers.values()),
+                "sequence": sequence,
+                "operations": operations,
+                "cds": {
+                    "selected_iteration": None,
+                    "candidate_count": 0,
+                    "makespan_minutes": round(max_completion_minutes, 2),
+                    "sequence": [row["id"] for row in sequence],
+                    "sequence_label": " -> ".join(row["id"] for row in sequence),
+                },
+                "cds_candidates": [],
+                "routes": [
+                    {
+                        "id": route["id"],
+                        "name": route["name"],
+                        "day": route["day"],
+                        "store_count": route["store_count"],
+                    }
+                    for route in routes["routes"]
+                ],
+            }
+        )
+
+    return {
+        "algorithm": {
+            "key": "excel_forward",
+            "name": "Forward Scheduling (PostgreSQL Import)",
+            "description": "Jadwal dibaca dari dss.production_schedule_lines hasil import sheet Forward Scheduling (2).",
+        },
+        "weeks": weeks,
+    }
+
+
+def build_bill_of_material(dataset: dict[str, Any]) -> dict[str, Any]:
+    entries = dataset.get("bom_entries", [])
+    grouped = []
+    bom_by_product = dataset.get("bom_by_product", {})
+
+    for product in dataset.get("products", []):
+        components = bom_by_product.get(product["id"], [])
+        grouped.append(
+            {
+                "id": product["id"],
+                "name": product["name"],
+                "family_name": product.get("family_name") or "",
+                "color": product.get("color") or "",
+                "component_count": len(components),
+                "components": components,
+            }
+        )
+
+    component_ids = {entry.get("material_id") for entry in entries if entry.get("material_id")}
+    return {
+        "source": "PostgreSQL BOM",
+        "policy": "BOM ditampilkan sebagai output dari tabel PostgreSQL dss.bom_versions dan dss.bom_lines.",
+        "products": grouped,
+        "rows": entries,
+        "product_count": len(grouped),
+        "component_count": len(component_ids),
+        "line_count": len(entries),
+    }
 
 
 def build_dss_payload(
     periods: int = 20,
     selected_product_id: str | None = None,
     selected_component_id: str | None = None,
-    workbook: str | None = None,
 ) -> dict[str, Any]:
-    dataset = get_dataset(workbook)
+    dataset = build_dataset_from_database()
     periods = max(1, min(periods, dataset["available_periods"]))
 
     products = dataset["products"]
     if not products:
-        raise ValueError("Tidak ada data produk yang berhasil dibaca dari workbook.")
+        raise ValueError("Tidak ada data produk yang berhasil dibaca dari PostgreSQL.")
 
     if selected_product_id not in dataset["product_lookup"]:
         selected_product_id = products[0]["id"]
 
+    forecast = build_forecast(dataset, periods)
     mps = build_mps(dataset, periods)
     rccp = build_rccp(dataset, periods)
     crp = build_crp(dataset, periods)
     routes = build_routes(dataset)
     mrp = build_mrp(dataset, selected_component_id, periods)
     dashboard = build_dashboard(mps, crp, routes, mrp, rccp)
-    schedule = build_schedule(mps, crp, routes)
+    schedule = build_schedule(mps, crp, routes, dataset)
+    bill_of_material = build_bill_of_material(dataset)
 
     return {
         "meta": {
@@ -477,7 +1056,7 @@ def build_dss_payload(
             "selected_product_id": selected_product_id,
             "selected_component_id": mrp["selected_item"]["id"] if mrp["selected_item"] else None,
         },
-        "files": list_available_workbooks(),
+        "files": list_database_sources(),
         "products": [
             {
                 "id": product["id"],
@@ -489,11 +1068,13 @@ def build_dss_payload(
             for product in products
         ],
         "dashboard": dashboard,
+        "forecast": forecast,
         "mps": mps,
         "mrp": mrp,
         "rccp": rccp,
         "crp": crp,
         "capacity": crp,
         "schedule": schedule,
+        "bill_of_material": bill_of_material,
         "routes": routes,
     }
