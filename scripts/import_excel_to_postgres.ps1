@@ -30,6 +30,22 @@ if (-not $passwordWasSet) {
     }
 }
 
+$saveConfig = Read-Host "Simpan konfigurasi ke .env.local agar backend bisa membaca PostgreSQL? (Y/n)"
+if ($saveConfig.Trim().ToLower() -notin @("n", "no", "tidak")) {
+    @(
+        "DSS_DB_HOST=$env:DSS_DB_HOST"
+        "DSS_DB_PORT=$env:DSS_DB_PORT"
+        "DSS_DB_NAME=$env:DSS_DB_NAME"
+        "DSS_DB_USER=$env:DSS_DB_USER"
+        "DSS_DB_PASSWORD=$env:DSS_DB_PASSWORD"
+        "DSS_DB_SCHEMA=$env:DSS_DB_SCHEMA"
+        "DSS_SCENARIO_CODE=$env:DSS_SCENARIO_CODE"
+        "DSS_PSQL_PATH=$env:DSS_PSQL_PATH"
+        "DSS_ALLOW_LOCAL_AUTH_FALLBACK=true"
+    ) | Set-Content -LiteralPath ".env.local" -Encoding UTF8
+    Write-Host ".env.local diperbarui. File ini sudah diabaikan Git."
+}
+
 $env:PGPASSWORD = $env:DSS_DB_PASSWORD
 
 try {
@@ -79,7 +95,7 @@ try {
         throw "Import workbook ke PostgreSQL gagal."
     }
 
-    Write-Host "Import selesai. Jalankan ulang backend agar membaca data terbaru."
+    Write-Host "Import selesai. Jalankan ulang backend agar membaca data terbaru dari PostgreSQL."
 } finally {
     Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
     if (-not $passwordWasSet) {
