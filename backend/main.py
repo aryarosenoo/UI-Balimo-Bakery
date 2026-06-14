@@ -107,9 +107,29 @@ def auth_change_password(request: ChangePasswordRequest) -> dict[str, object]:
     return {"user": user, "message": "Password berhasil diperbarui."}
 
 
+def build_database_sources_payload() -> dict[str, object]:
+    sources = list_database_sources()
+    return {
+        "sources": sources,
+        "files": sources,
+        "source": "PostgreSQL",
+        "data_source": "PostgreSQL",
+        "message": "Runtime backend membaca schema PostgreSQL dss; Excel hanya dipakai oleh script importer awal.",
+    }
+
+
+@app.get("/api/database/sources")
+def database_sources() -> dict[str, object]:
+    try:
+        return build_database_sources_payload()
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @app.get("/api/files")
 def files() -> dict[str, object]:
-    return {"files": list_database_sources(), "source": "PostgreSQL"}
+    """Compatibility endpoint for the existing frontend name."""
+    return database_sources()
 
 
 @app.get("/api/database/status")
@@ -168,8 +188,9 @@ def api_root() -> dict[str, object]:
         "message": "Bakery DSS API berjalan.",
         "endpoints": [
             "/api/health",
-            "/api/files",
             "/api/database/status",
+            "/api/database/sources",
+            "/api/files",
             "/api/auth/users",
             "/api/auth/login",
             "/api/auth/change-password",

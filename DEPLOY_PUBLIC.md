@@ -7,7 +7,7 @@ Dokumen ini menyiapkan aplikasi agar bisa dipakai user dari internet, bukan hany
 - Satu web service menjalankan FastAPI.
 - FastAPI melayani API di `/api/*`.
 - FastAPI juga melayani frontend React hasil `npm run build` dari folder `dist/`.
-- PostgreSQL berada di cloud/managed database.
+- PostgreSQL schema `dss` menjadi sumber data runtime.
 - PostgreSQL tidak perlu diekspos langsung ke user publik.
 
 ## Opsi Cepat: Render Blueprint
@@ -20,11 +20,11 @@ Dokumen ini menyiapkan aplikasi agar bisa dipakai user dari internet, bukan hany
    - PostgreSQL database `balimo-bakery-db`
 5. Tunggu build Docker selesai.
 
-Setelah service dan database dibuat, database masih perlu diisi schema dan data.
+Setelah service dan database dibuat, database masih perlu diisi schema dan data. Runtime aplikasi membaca PostgreSQL, bukan file Excel.
 
 ## Inisialisasi Database Cloud
 
-Jalankan perintah ini dari laptop yang punya akses ke file Excel final.
+Jalankan perintah ini dari laptop yang punya akses ke database cloud. Jika data awal masih berada di Excel final, Excel hanya dipakai sekali untuk import ke PostgreSQL.
 
 ### 1. Set environment PostgreSQL cloud
 
@@ -55,13 +55,13 @@ Gunakan host, database, user, dan password dari provider cloud.
   -f database\runtime_schema.sql
 ```
 
-### 3. Import data dari Excel final
+### 3. Import data awal ke PostgreSQL
 
 ```powershell
 .\.venv\Scripts\python.exe -m backend.postgres_importer "D:\Download\Data_TA__FINAL.xlsx"
 ```
 
-Importer akan mengisi:
+Importer akan membaca workbook sekali, lalu mengisi tabel runtime PostgreSQL:
 
 - `dss.demand_plans` untuk forecast
 - `dss.mps_lines` untuk MPS

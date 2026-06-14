@@ -540,7 +540,7 @@ const DEFAULT_PLANNER_STATE = {
     supplierId: "SUP-CORET2",
   })),
   suppliers: [
-    { id: "SUP-CORET2", name: "Supplier Bahan Baku Coret2", leadTimeDays: 2, contact: "Harga dari coret2 data.xlsx" },
+    { id: "SUP-CORET2", name: "Supplier Bahan Baku Coret2", leadTimeDays: 2, contact: "Harga dari data master PostgreSQL" },
   ],
   bom: CORET2_BOM,
   workCenters: [
@@ -634,7 +634,7 @@ function getMaterialPricing(item = {}) {
       packageSize: directPackageSize,
       packageUnit: item.packageUnit || item.package_unit || item.unit || "unit",
       unitCost: directPackagePrice / directPackageSize,
-      source: "coret2 data.xlsx",
+      source: "Data master PostgreSQL",
     };
   }
 
@@ -653,7 +653,7 @@ function getMaterialPricing(item = {}) {
       packageSize: 1,
       packageUnit: item.unit || "unit",
       unitCost: 0,
-      source: "Tidak ada di coret2 data.xlsx",
+      source: "Belum tersedia di data master PostgreSQL",
     };
   }
 
@@ -665,7 +665,7 @@ function getMaterialPricing(item = {}) {
     packageSize: material.packageSize,
     packageUnit: material.packageUnit,
     unitCost: material.packagePrice / material.packageSize,
-    source: "coret2 data.xlsx",
+    source: "Data master PostgreSQL",
   };
 }
 
@@ -729,8 +729,8 @@ function buildCoret2BillOfMaterialPayload() {
   const componentIds = new Set(rows.map((row) => row.material_id));
 
   return {
-    source: "coret2 data.xlsx + gambar BOM TA",
-    policy: "BOM memakai kebutuhan per 1 pcs produk dari gambar, sedangkan harga bahan baku mengikuti Excel.",
+    source: "Data master PostgreSQL + rancangan BOM TA",
+    policy: "BOM memakai kebutuhan per 1 pcs produk dari rancangan, sedangkan harga bahan baku mengikuti data master PostgreSQL.",
     products,
     rows,
     product_count: products.length,
@@ -879,6 +879,18 @@ function sanitizeUser(user) {
   }
   const { password, password_hash, passwordHash, ...safeUser } = user;
   return safeUser;
+}
+
+function describeFetchError(error, fallback) {
+  const message = error?.message || "";
+  if (
+    message === "Failed to fetch" ||
+    message.includes("NetworkError") ||
+    message.includes("Load failed")
+  ) {
+    return "Backend belum bisa dijangkau. Pastikan FastAPI berjalan di http://127.0.0.1:8000 dan frontend memakai proxy /api.";
+  }
+  return message || fallback;
 }
 
 function loadSessionUser() {
@@ -2588,7 +2600,7 @@ function MaterialOrderReportPage({ mrp }) {
                 <th className="right">Gross Req</th>
                 <th className="right">Net Req</th>
                 <th className="right">PORel</th>
-                <th className="right">Harga Excel</th>
+                <th className="right">Harga Referensi</th>
                 <th className="right">Estimasi Biaya</th>
               </tr>
             </thead>
@@ -2621,7 +2633,7 @@ function MaterialOrderReportPage({ mrp }) {
           </table>
         </div>
         <div className="inline-note">
-          Harga bahan baku mengikuti sheet Harga Bahan Baku pada coret2 data.xlsx. Estimasi biaya dihitung proporsional terhadap satuan pakai BOM.
+          Harga bahan baku mengikuti data master bahan baku PostgreSQL. Estimasi biaya dihitung proporsional terhadap satuan pakai BOM.
         </div>
       </Card>
     </>
@@ -3780,7 +3792,7 @@ function PlannerWorkbench() {
                 <tr>
                   <th>Bahan</th>
                   <th>Unit</th>
-                  <th className="right">Harga Excel</th>
+                  <th className="right">Harga Referensi</th>
                   <th className="right">Stok</th>
                   <th className="right">SS</th>
                   <th className="right">Lot</th>
@@ -4345,7 +4357,7 @@ function App() {
     } catch (caughtError) {
       return {
         ok: false,
-        message: caughtError.message || "Login belum bisa diproses.",
+        message: describeFetchError(caughtError, "Login belum bisa diproses."),
       };
     }
   }
@@ -4379,7 +4391,7 @@ function App() {
     } catch (caughtError) {
       return {
         ok: false,
-        message: caughtError.message || "Password belum bisa diperbarui.",
+        message: describeFetchError(caughtError, "Password belum bisa diperbarui."),
       };
     }
   }
@@ -4475,7 +4487,7 @@ function App() {
         if (caughtError.name === "AbortError" || !isActive) {
           return;
         }
-        setError(caughtError.message || "Terjadi kesalahan yang tidak diketahui.");
+        setError(describeFetchError(caughtError, "Terjadi kesalahan yang tidak diketahui."));
       } finally {
         if (activeControllerRef.current === controller) {
           activeControllerRef.current = null;
@@ -4547,7 +4559,7 @@ function App() {
         if (!isActive) {
           return;
         }
-        setIntegrationError(caughtError.message || "Integrasi database dan forecast belum bisa dibaca.");
+        setIntegrationError(describeFetchError(caughtError, "Integrasi database dan forecast belum bisa dibaca."));
       }
     }
 
@@ -4583,7 +4595,7 @@ function App() {
         if (!isActive) {
           return;
         }
-        setForecastError(caughtError.message || "Hasil forecast PostgreSQL belum bisa diproses.");
+        setForecastError(describeFetchError(caughtError, "Hasil forecast PostgreSQL belum bisa diproses."));
       } finally {
         if (isActive) {
           setForecastLoading(false);
@@ -4621,7 +4633,7 @@ function App() {
       setForecastPrepared(body);
       setIntegrationError("");
     } catch (caughtError) {
-      setIntegrationError(caughtError.message || "Input forecast belum bisa diproses.");
+      setIntegrationError(describeFetchError(caughtError, "Input forecast belum bisa diproses."));
     } finally {
       setForecastSubmitting(false);
     }
@@ -4633,10 +4645,6 @@ function App() {
 
   if (loading && !payload) {
     return <LoadingState />;
-  }
-
-  if (error && !payload) {
-    return <ErrorState message={error} onRetry={() => setReloadToken((value) => value + 1)} />;
   }
 
   const dashboard = payload?.dashboard ?? {};
@@ -5989,7 +5997,7 @@ function App() {
             Work center termonitor: <strong>{formatNumber(capacity.work_centers?.length || 0)}</strong>
           </span>
           <span className="metric-pill">
-            File sumber: <strong>{payload?.meta?.source_name || "-"}</strong>
+            Sumber data: <strong>{payload?.meta?.source_name || "-"}</strong>
           </span>
         </div>
       </main>

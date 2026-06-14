@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import subprocess
 from threading import Lock
@@ -105,6 +106,49 @@ def safe_user(user: dict[str, Any] | None) -> dict[str, Any] | None:
         "department": user["department"],
         "phone": user["phone"],
     }
+
+
+def is_local_auth_fallback_allowed() -> bool:
+    configured = os.getenv("DSS_ALLOW_LOCAL_AUTH_FALLBACK")
+    if configured is not None:
+        return configured.strip().lower() in {"1", "true", "yes", "on"}
+
+    config = get_database_config()
+    return config["host"] in {"127.0.0.1", "localhost", "::1"}
+
+
+def default_user_by_username(username: str) -> dict[str, Any] | None:
+    normalized = str(username or "").strip().lower()
+    for user in DEFAULT_AUTH_USERS:
+        if user["username"].lower() == normalized:
+            return user
+    return None
+
+
+def default_user_by_id(user_id: str) -> dict[str, Any] | None:
+    normalized = str(user_id or "").strip()
+    for user in DEFAULT_AUTH_USERS:
+        if user["id"] == normalized:
+            return user
+    return None
+
+
+def safe_default_user(user: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not user:
+        return None
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "name": user["name"],
+        "role": user["role"],
+        "department": user["department"],
+        "phone": user["phone"],
+        "auth_source": "local-dev-fallback",
+    }
+
+
+def is_database_auth_unavailable(exc: AuthServiceError) -> bool:
+    return exc.status_code == 503
 
 
 def get_auth_table_name() -> str:
@@ -225,7 +269,12 @@ def fetch_auth_rows(where_sql: str = "", timeout: int = 15) -> list[dict[str, An
 
 
 def get_public_users() -> list[dict[str, Any]]:
-    return [safe_user(row_to_user(row)) for row in fetch_auth_rows()]
+    try:
+        return [safe_user(row_to_user(row)) for row in fetch_auth_rows()]
+    except AuthServiceError as exc:
+        if is_local_auth_fallback_allowed() and is_database_auth_unavailable(exc):
+            return [safe_default_user(user) for user in DEFAULT_AUTH_USERS]
+        raise
 
 
 def get_user_by_username(username: str) -> dict[str, Any] | None:
@@ -249,13 +298,25 @@ def get_user_by_id(user_id: str) -> dict[str, Any] | None:
 
 
 def authenticate_user(username: str, password: str) -> dict[str, Any]:
-    user = get_user_by_username(username)
-    if not user or not verify_password(str(password or ""), user["password_hash"]):
-        raise AuthServiceError("Username atau password tidak sesuai dengan data login.", status_code=401)
-    public_user = safe_user(user)
-    if public_user is None:
-        raise AuthServiceError("Data pengguna belum lengkap.", status_code=500)
-    return public_user
+    try:
+        user = get_user_by_username(username)
+        if not user or not verify_password(str(password or ""), user["password_hash"]):
+            raise AuthServiceError("Username atau password tidak sesuai dengan data login.", status_code=401)
+        public_user = safe_user(user)
+        if public_user is None:
+            raise AuthServiceError("Data pengguna belum lengkap.", status_code=500)
+        return public_user
+    except AuthServiceError as exc:
+        if not (is_local_auth_fallback_allowed() and is_database_auth_unavailable(exc)):
+            raise
+
+        fallback_user = default_user_by_username(username)
+        if not fallback_user or str(password or "") != fallback_user["password"]:
+            raise AuthServiceError("Username atau password tidak sesuai dengan data login.", status_code=401) from exc
+        public_user = safe_default_user(fallback_user)
+        if public_user is None:
+            raise AuthServiceError("Data pengguna fallback belum lengkap.", status_code=500) from exc
+        return public_user
 
 
 def change_user_password(
@@ -265,7 +326,15 @@ def change_user_password(
     user_id: str | None = None,
     username: str | None = None,
 ) -> dict[str, Any]:
-    user = get_user_by_id(user_id or "") if user_id else get_user_by_username(username or "")
+    try:
+        user = get_user_by_id(user_id or "") if user_id else get_user_by_username(username or "")
+    except AuthServiceError as exc:
+        if is_local_auth_fallback_allowed() and is_database_auth_unavailable(exc):
+            raise AuthServiceError(
+                "Password belum bisa diperbarui karena database PostgreSQL belum terhubung.",
+                status_code=503,
+            ) from exc
+        raise
     if not user:
         raise AuthServiceError("Pengguna tidak ditemukan.", status_code=404)
     if not verify_password(str(current_password or ""), user["password_hash"]):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from statistics import mean
 from typing import Any
 
@@ -23,6 +24,22 @@ ROUTE_COLORS = ["#f97316", "#38bdf8", "#22c55e", "#a855f7", "#f43f5e", "#eab308"
 
 MRP_CATEGORY_ORDER = ["raw_material", "intermediate", "final_product"]
 
+RUNTIME_SOURCE_TABLES = [
+    "dss.planning_scenarios",
+    "dss.planning_periods",
+    "dss.items",
+    "dss.demand_plans",
+    "dss.mps_lines",
+    "dss.mrp_lines",
+    "dss.rccp_lines",
+    "dss.crp_lines",
+    "dss.production_schedule_lines",
+    "dss.bom_versions",
+    "dss.bom_lines",
+    "dss.delivery_routes",
+    "dss.stores",
+]
+
 
 def to_float(value: Any) -> float:
     try:
@@ -37,6 +54,10 @@ def to_int(value: Any) -> int:
 
 def run_json_query(sql: str, timeout: int = 30) -> Any:
     config = get_database_config()
+    if not config["password"]:
+        raise ValueError("Password database belum dikonfigurasi di DSS_DB_PASSWORD atau PGPASSWORD.")
+    if not Path(config["psql_path"]).exists():
+        raise ValueError(f"psql tidak ditemukan di {config['psql_path']}.")
     result = run_psql_query(config, sql, timeout=timeout)
     if result.returncode != 0:
         raise ValueError(result.stderr.strip() or "Query PostgreSQL gagal.")
@@ -645,7 +666,9 @@ def build_dataset_from_database() -> dict[str, Any]:
 
     return {
         "source_name": scenario.get("scenario_name") or scenario.get("scenario_code") or "PostgreSQL",
-        "source_path": "PostgreSQL",
+        "source_path": f"PostgreSQL schema {config['schema']}",
+        "data_source": "PostgreSQL",
+        "source_tables": RUNTIME_SOURCE_TABLES,
         "visible_sheets": [],
         "available_periods": available_periods,
         "week_numbers": week_numbers,

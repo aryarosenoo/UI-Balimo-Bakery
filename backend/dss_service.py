@@ -1021,17 +1021,160 @@ def build_bill_of_material(dataset: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_empty_period_rows(periods: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "week": index + 1,
+            "week_number": index + 1,
+            "period": f"W{index + 1}",
+            "total": 0,
+        }
+        for index in range(periods)
+    ]
+
+
+def build_empty_dss_payload(
+    periods: int,
+    *,
+    selected_product_id: str | None = None,
+    selected_component_id: str | None = None,
+    message: str,
+) -> dict[str, Any]:
+    empty_mps = {
+        "periods": build_empty_period_rows(periods),
+        "rows": [],
+        "total_production": 0,
+    }
+    empty_forecast = {
+        "periods": [
+            {
+                "week": index + 1,
+                "week_number": index + 1,
+                "period": f"W{index + 1}",
+                "total": 0.0,
+                "total_customer_order": 0.0,
+            }
+            for index in range(periods)
+        ],
+        "rows": [],
+        "total_forecast": 0.0,
+        "source": "PostgreSQL (fallback)",
+        "policy": "Database PostgreSQL belum terhubung; payload kosong sementara dipakai agar UI tetap dapat dibuka.",
+    }
+    empty_mrp = {
+        "categories": [
+            {"key": key, "label": MRP_CATEGORY_LABELS[key], "count": 0}
+            for key in MRP_CATEGORY_ORDER
+        ],
+        "items": [],
+        "items_by_category": {key: [] for key in MRP_CATEGORY_ORDER},
+        "selected_category": "raw_material",
+        "selected_item": None,
+        "periods": [],
+        "policy": "Database PostgreSQL belum terhubung, sehingga MRP sementara kosong.",
+    }
+    empty_capacity = {
+        "periods": [],
+        "work_centers": [],
+        "total_available_minutes": 0.0,
+        "total_capacity_minutes": 0.0,
+        "detail_rows": [],
+        "active_work_center_ids": [],
+        "product_rows": [],
+        "policy": "Database PostgreSQL belum terhubung, sehingga kapasitas sementara kosong.",
+    }
+    empty_routes = {"routes": [], "stores": [], "total_stores": 0}
+    empty_schedule = {
+        "algorithm": {
+            "key": "fallback",
+            "name": "PostgreSQL Fallback",
+            "description": "Database PostgreSQL belum terhubung; payload kosong dipakai agar frontend tetap dapat diakses.",
+        },
+        "weeks": [],
+    }
+    empty_dashboard = {
+        "total_production": 0,
+        "average_capacity_utilization": 0.0,
+        "average_rccp_utilization": 0.0,
+        "average_crp_utilization": 0.0,
+        "peak_load": None,
+        "peak_rccp_load": None,
+        "active_routes": 0,
+        "active_stores": 0,
+        "distribution": [],
+        "mrp_item_count": 0,
+        "mrp_raw_material_count": 0,
+        "mrp_intermediate_count": 0,
+        "mrp_final_count": 0,
+    }
+
+    try:
+        database_sources = list_database_sources()
+    except ValueError:
+        database_sources = []
+
+    return {
+        "meta": {
+            "source_name": "PostgreSQL (fallback)",
+            "source_path": "PostgreSQL schema dss",
+            "data_source": "PostgreSQL",
+            "source_tables": [],
+            "visible_sheets": [],
+            "available_periods": periods,
+            "periods": periods,
+            "selected_product_id": selected_product_id,
+            "selected_component_id": selected_component_id,
+            "fallback": True,
+            "fallback_message": message,
+        },
+        "files": database_sources,
+        "sources": database_sources,
+        "products": [],
+        "dashboard": empty_dashboard,
+        "forecast": empty_forecast,
+        "mps": empty_mps,
+        "mrp": empty_mrp,
+        "rccp": empty_capacity,
+        "crp": empty_capacity,
+        "capacity": empty_capacity,
+        "schedule": empty_schedule,
+        "bill_of_material": {
+            "source": "PostgreSQL (fallback)",
+            "policy": "Database PostgreSQL belum terhubung, sehingga BOM sementara kosong.",
+            "products": [],
+            "rows": [],
+            "product_count": 0,
+            "component_count": 0,
+            "line_count": 0,
+        },
+        "routes": empty_routes,
+    }
+
+
 def build_dss_payload(
     periods: int = 20,
     selected_product_id: str | None = None,
     selected_component_id: str | None = None,
 ) -> dict[str, Any]:
-    dataset = build_dataset_from_database()
-    periods = max(1, min(periods, dataset["available_periods"]))
+    try:
+        dataset = build_dataset_from_database()
+        periods = max(1, min(periods, dataset["available_periods"]))
+    except ValueError as exc:
+        return build_empty_dss_payload(
+            periods=max(1, min(periods, 20)),
+            selected_product_id=selected_product_id,
+            selected_component_id=selected_component_id,
+            message=str(exc),
+        )
 
     products = dataset["products"]
     if not products:
-        raise ValueError("Tidak ada data produk yang berhasil dibaca dari PostgreSQL.")
+        return build_empty_dss_payload(
+            periods=periods,
+            selected_product_id=selected_product_id,
+            selected_component_id=selected_component_id,
+            message="Tidak ada data produk yang berhasil dibaca dari PostgreSQL.",
+        )
 
     if selected_product_id not in dataset["product_lookup"]:
         selected_product_id = products[0]["id"]
@@ -1045,18 +1188,22 @@ def build_dss_payload(
     dashboard = build_dashboard(mps, crp, routes, mrp, rccp)
     schedule = build_schedule(mps, crp, routes, dataset)
     bill_of_material = build_bill_of_material(dataset)
+    database_sources = list_database_sources()
 
     return {
         "meta": {
             "source_name": dataset["source_name"],
             "source_path": dataset["source_path"],
+            "data_source": dataset.get("data_source", "PostgreSQL"),
+            "source_tables": dataset.get("source_tables", []),
             "visible_sheets": dataset["visible_sheets"],
             "available_periods": dataset["available_periods"],
             "periods": periods,
             "selected_product_id": selected_product_id,
             "selected_component_id": mrp["selected_item"]["id"] if mrp["selected_item"] else None,
         },
-        "files": list_database_sources(),
+        "files": database_sources,
+        "sources": database_sources,
         "products": [
             {
                 "id": product["id"],

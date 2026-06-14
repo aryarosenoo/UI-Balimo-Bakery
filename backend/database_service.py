@@ -9,6 +9,8 @@ from typing import Any
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_PSQL_PATH = Path(r"D:\PostgreeSQL\bin\psql.exe")
+ENV_FILE_NAMES = (".env.local", ".env")
+_ENV_FILES_LOADED = False
 
 KEY_TABLES = [
     {"name": "planning_scenarios", "label": "Planning Scenarios"},
@@ -35,7 +37,32 @@ KEY_TABLES = [
 ]
 
 
+def load_env_files() -> None:
+    global _ENV_FILES_LOADED
+
+    if _ENV_FILES_LOADED:
+        return
+
+    for file_name in ENV_FILE_NAMES:
+        env_path = BASE_DIR / file_name
+        if not env_path.exists():
+            continue
+
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+    _ENV_FILES_LOADED = True
+
+
 def get_database_config() -> dict[str, str]:
+    load_env_files()
     return {
         "host": os.getenv("DSS_DB_HOST", "127.0.0.1"),
         "port": os.getenv("DSS_DB_PORT", "5432"),

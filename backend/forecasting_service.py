@@ -840,7 +840,7 @@ def build_database_forecast_payload(horizon_days: int) -> dict[str, Any]:
         "store_products": [],
         "routes": [],
         "model_evaluation": {
-            "method": "Forecast dibaca dari demand_plans PostgreSQL; evaluasi model ML tidak dipakai untuk sinkronisasi angka Excel.",
+            "method": "Forecast dibaca dari demand_plans PostgreSQL; evaluasi model ML tidak dipakai untuk sinkronisasi angka runtime.",
             "overall": {},
             "comparison": [],
             "best_model": None,

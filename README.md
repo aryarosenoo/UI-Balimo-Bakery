@@ -1,11 +1,14 @@
 # Bakery DSS Dashboard
 
-Dashboard ini menghubungkan frontend React dengan backend FastAPI untuk membaca workbook Excel dari folder `Data TA`, lalu menampilkan:
+Dashboard ini menghubungkan frontend React dengan backend FastAPI. Runtime backend memakai PostgreSQL schema `dss` sebagai sumber data utama, sesuai rancangan database DSS Balimo Bakery.
+
+## Fitur
 
 - Dashboard ringkas produksi dan kapasitas
+- Forecast demand dari tabel PostgreSQL
 - Tabel MPS mingguan
-- MRP sederhana per produk dan komponen
-- Kapasitas work center berbasis routing
+- MRP per produk dan komponen
+- Kapasitas RCCP/CRP berbasis work center dan routing
 - Output jadwal produksi dan distribusi
 - Mapping rute dan toko
 
@@ -13,33 +16,60 @@ Dashboard ini menghubungkan frontend React dengan backend FastAPI untuk membaca 
 
 - `scheduling.jsx`: komponen frontend utama
 - `src/`: entry Vite dan stylesheet
-- `backend/`: API FastAPI + loader workbook Excel
-- `Data TA/`: lokasi input data `.xlsx`
+- `backend/`: API FastAPI berbasis PostgreSQL
+- `database/runtime_schema.sql`: schema PostgreSQL runtime
+- `backend/postgres_importer.py`: script import awal dari workbook ke PostgreSQL
+
+## Konfigurasi Database
+
+Backend membaca konfigurasi PostgreSQL dari environment:
+
+```powershell
+$env:DSS_DB_HOST="127.0.0.1"
+$env:DSS_DB_PORT="5432"
+$env:DSS_DB_NAME="balimo_bakery_dss"
+$env:DSS_DB_USER="postgres"
+$env:DSS_DB_PASSWORD="password-postgres-anda"
+$env:DSS_DB_SCHEMA="dss"
+$env:DSS_SCENARIO_CODE="default"
+$env:DSS_PSQL_PATH="D:\PostgreeSQL\bin\psql.exe"
+```
+
+Jika `DSS_DB_PASSWORD` atau `PGPASSWORD` belum diset, login dan endpoint data akan gagal karena backend tidak bisa membuka PostgreSQL.
 
 ## Menjalankan Backend
 
-```bash
+```powershell
 python -m venv .venv
-.venv\Scripts\activate
+.\.venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn backend.main:app --reload
+python -m uvicorn backend.main:app --reload
+```
+
+Healthcheck:
+
+```text
+http://127.0.0.1:8000/api/health
+http://127.0.0.1:8000/api/database/status
 ```
 
 ## Menjalankan Frontend
 
-```bash
+```powershell
 npm install
 npm run dev
 ```
 
-Frontend Vite akan memanggil backend melalui proxy `/api` ke `http://127.0.0.1:8000`.
+Frontend Vite memanggil backend melalui proxy `/api` ke `http://127.0.0.1:8000`.
 
 ## Input Data
 
-Tempatkan file Excel `.xlsx` di folder `Data TA`. Sistem akan otomatis mengambil file terbaru dari folder tersebut. Untuk kompatibilitas awal, file workbook yang sudah ada juga disalin ke sana.
+Runtime aplikasi tidak membaca Excel. Data operasional dibaca dari tabel PostgreSQL seperti `dss.demand_plans`, `dss.mps_lines`, `dss.mrp_lines`, `dss.rccp_lines`, `dss.crp_lines`, `dss.production_schedule_lines`, `dss.bom_versions`, dan `dss.bom_lines`.
 
-## Catatan Asumsi
+Workbook Excel hanya dipakai sebagai sumber import awal jika database perlu diisi ulang:
 
-- Sheet `Master Production Schedule` dipakai sebagai sumber produksi mingguan utama.
-- Perhitungan MRP di dashboard memakai kebijakan sederhana `LFL` dengan stok awal `0`, safety stock `0`, lot size `1`, dan lead time `0`.
-- Perhitungan kapasitas memakai `run time` per unit dan menambahkan `setup time` sekali tiap minggu jika ada produksi pada work center terkait.
+```powershell
+.\.venv\Scripts\python.exe -m backend.postgres_importer "D:\Download\Data_TA__FINAL.xlsx"
+```
+
+Setelah import selesai, backend memakai PostgreSQL untuk login, dashboard, forecast, MPS, MRP, RCCP, CRP, BOM, dan scheduling.
