@@ -72,4 +72,10 @@ Workbook Excel hanya dipakai sebagai sumber import awal jika database perlu diis
 .\.venv\Scripts\python.exe -m backend.postgres_importer "D:\Download\Data_TA__FINAL.xlsx"
 ```
 
+Untuk lokal, pakai script berikut agar password PostgreSQL diminta aman lewat prompt dan schema runtime dicek otomatis:
+
+```powershell
+.\scripts\import_excel_to_postgres.ps1
+```
+
 Setelah import selesai, backend memakai PostgreSQL untuk login, dashboard, forecast, MPS, MRP, RCCP, CRP, BOM, dan scheduling.
